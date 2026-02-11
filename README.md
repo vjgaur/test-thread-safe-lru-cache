@@ -2,7 +2,7 @@
 # Thread-Safe LRU Cache Implementation Details--
 
 > **📖 See [LRU_Readme.md](LRU_Readme.md) for implementation details, API reference, and usage instructions.**
-> **See [DESIGN.md](DESIGN.md) for architecture and design decisions.**
+> **See [Design.md](Design.md) for architecture and design decisions.**
 
 
 

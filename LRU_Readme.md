@@ -190,7 +190,7 @@ Validate thread safety under contention using barriers for synchronized starts.
 ## Design Decisions
 
 For the full design rationale, architecture diagrams, and trade-off analysis,
-see [DESIGN.md](DESIGN.md).
+see [Design.md](Design.md).
 
 Key decisions summarized:
 
