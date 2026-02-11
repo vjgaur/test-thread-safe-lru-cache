@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 
 //A Node in the arena-baed doubly-linked list stored in a Vec-based arena
-struct Node<K,V> {
+struct Node<K, V> {
     key: K,
     value: V,
     prev: Option<usize>,
@@ -21,23 +21,23 @@ struct Node<K,V> {
 }
 
 /// Single-threaded LRU cache
-/// Not safe for concurrent use 
+/// Not safe for concurrent use
 ///Check `ThreadSafeLruCache` for the thread-safe wrapper
-pub struct LruCache<K,V> {
+pub struct LruCache<K, V> {
     capacity: usize,
-    map: HashMap<K,usize>, // key -> index in nodes arena
-    nodes: Vec<Node<K,V>>, // arena for linked list nodes
-    head: Option<usize>, // most recently used
-    tail: Option<usize>, // least recently used
-    free_list: Vec<usize>, // reusable slots from evicted nodes
+    map: HashMap<K, usize>, // key -> index in nodes arena
+    nodes: Vec<Node<K, V>>, // arena for linked list nodes
+    head: Option<usize>,    // most recently used
+    tail: Option<usize>,    // least recently used
+    free_list: Vec<usize>,  // reusable slots from evicted nodes
 }
 
-impl<K: Hash + Eq + Clone, V> LruCache<K,V> {
+impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
     /// Creates a new LRU cache with the given maximum capacity.
     ///
     /// # Panics
     /// Panics if `capacity` is 0.
-    pub fn new(capacity: usize)-> Self {
+    pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "Cache capacity must be greater than 0");
 
         Self {
@@ -46,135 +46,129 @@ impl<K: Hash + Eq + Clone, V> LruCache<K,V> {
             nodes: Vec::with_capacity(capacity),
             head: None,
             tail: None,
-            free_list:Vec::new(),
+            free_list: Vec::new(),
         }
     }
 
-
-// ---------------------------------------------------------------
+    // ---------------------------------------------------------------
     // Linked list helpers (private)
     // ---------------------------------------------------------------
 
     /// Unlinks a node from its current position in the doubly-linked list.
     /// Does NOT remove it from the map or free the slot.
+    fn unlink(&mut self, index: usize) {
+        let prev = self.nodes[index].prev;
+        let next = self.nodes[index].next;
 
-fn unlink(&mut self, index:usize){
+        //fix the previous node's next pointer (or update head)
+        match prev {
+            Some(p) => self.nodes[p].next = next,
+            None => self.head = next, //node was head
+        }
 
-    let prev = self.nodes[index].prev;
-    let next = self.nodes[index].next;
+        //Fix the previous node's prev pointer (or update tail)
+        match next {
+            Some(n) => self.nodes[n].prev = prev,
+            None => self.tail = prev,
+        }
+        //Clear the node's own pointers
+        self.nodes[index].prev = None;
+        self.nodes[index].next = None;
+    }
+    /// Inserts a node at the head of the list (most recently used position).
+    /// Assumes the node is already unlinked.
+    fn push_front(&mut self, index: usize) {
+        self.nodes[index].prev = None;
+        self.nodes[index].next = self.head;
 
-    //fix the previous node's next pointer (or update head)
-    match prev  {
-        Some(p) => self.nodes[p].next = next,
-        None => self.head = next, //node was head
+        if let Some(old_head) = self.head {
+            self.nodes[old_head].prev = Some(index);
+        }
+        self.head = Some(index);
+
+        // if list was empty this node is also the tail
+        if self.tail.is_none() {
+            self.tail = Some(index);
+        }
     }
 
-    //Fix the previous node's prev pointer (or update tail)
-    match next {
-        Some(n) => self.nodes[n].prev = prev,
-        None => self.tail = prev,
+    /// Evicts the tail node (least recently used).
+    /// Returns the evicted key so the caller can remove it from the map.
+    /// The slot is added to the free list for reuse.
+    fn evict_tail(&mut self) -> Option<K> {
+        let tail_index = self.tail?;
+        self.unlink(tail_index);
+
+        //Clone the key before recycling the slot
+        let evicated_key = self.nodes[tail_index].key.clone();
+
+        //Add the slot to the free list for reuse
+        self.free_list.push(tail_index);
+
+        Some(evicated_key)
     }
-    //Clear the node's own pointers
-    self.nodes[index].prev = None;
-    self.nodes[index].next = None;
 
-}
-/// Inserts a node at the head of the list (most recently used position).
-/// Assumes the node is already unlinked.
-fn push_front(&mut self, index: usize){
-    
-    self.nodes[index].prev = None;
-    self.nodes[index].next = self.head;
-
-    if let Some(old_head) = self.head {
-        self.nodes[old_head].prev = Some(index);
+    /// Allocates a slot in the arena for a new node.
+    /// Reuses a free slot if available, otherwise pushes to the Vec.
+    fn allocate_node(&mut self, key: K, value: V) -> usize {
+        if let Some(index) = self.free_list.pop() {
+            // Reuse an evicted slot
+            self.nodes[index] = Node {
+                key,
+                value,
+                prev: None,
+                next: None,
+            };
+            index
+        } else {
+            // Allocate a new slot at the end of the arena
+            let index = self.nodes.len();
+            self.nodes.push(Node {
+                key,
+                value,
+                prev: None,
+                next: None,
+            });
+            index
+        }
     }
-    self.head = Some(index);
 
-    // if list was empty this node is also the tail 
-    if self.tail.is_none(){
-        self.tail = Some(index);
+    // ---------------------------------------------------------------
+    // Public API
+    // ---------------------------------------------------------------
+
+    /// Retrieves the value for a key, marking it as most recently used.
+    ///
+    /// Returns `None` if the key is not present.
+    pub fn get(&mut self, key: &K) -> Option<&V> {
+        // Look up the index; we need to separate the borrow of self.map
+        // from the mutable borrows in unlink/push_front.
+        let index = *self.map.get(key)?;
+
+        // Move to front (mark as most recently used)
+        self.unlink(index);
+        self.push_front(index);
+
+        Some(&self.nodes[index].value)
     }
-}
 
-/// Evicts the tail node (least recently used).
-/// Returns the evicted key so the caller can remove it from the map.
-/// The slot is added to the free list for reuse.
-fn evict_tail(&mut self) -> Option<K> {
-    let tail_index = self.tail?;
-    self.unlink(tail_index);
-
-    //Clone the key before recycling the slot 
-    let evicated_key = self.nodes[tail_index].key.clone();
-
-    //Add the slot to the free list for reuse 
-    self.free_list.push(tail_index);
-
-    Some(evicated_key)
-}
-
-/// Allocates a slot in the arena for a new node.
-/// Reuses a free slot if available, otherwise pushes to the Vec.
-fn allocate_node(&mut self, key: K, value: V) -> usize {
-    if let Some(index) = self.free_list.pop() {
-        // Reuse an evicted slot
-        self.nodes[index] = Node {
-            key,
-            value,
-            prev: None,
-            next: None,
-        };
-        index
-    } else {
-        // Allocate a new slot at the end of the arena
-        let index = self.nodes.len();
-        self.nodes.push(Node {
-            key,
-            value,
-            prev: None,
-            next: None,
-        });
-        index
-    }
-}
-
-// ---------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------
-
-/// Retrieves the value for a key, marking it as most recently used.
-///
-/// Returns `None` if the key is not present.
-
-pub fn get(&mut self, key: &K)-> Option<&V> {
-    // Look up the index; we need to separate the borrow of self.map
-    // from the mutable borrows in unlink/push_front.
-    let index = *self.map.get(key)?;
-
-    // Move to front (mark as most recently used)
-    self.unlink(index);
-    self.push_front(index);
-
-    Some(&self.nodes[index].value)
-}
-
-/// Inserts a key-value pair into the cache.
-///
-/// If the key already exists, its value is updated and it becomes
-/// the most recently used. If the cache is at capacity, the least
-/// recently used entry is evicted.
-pub fn put(&mut self, key: K, value: V) {
-    if let Some(&index) = self.map.get(&key) {
+    /// Inserts a key-value pair into the cache.
+    ///
+    /// If the key already exists, its value is updated and it becomes
+    /// the most recently used. If the cache is at capacity, the least
+    /// recently used entry is evicted.
+    pub fn put(&mut self, key: K, value: V) {
+        if let Some(&index) = self.map.get(&key) {
             // Key exists: update value in place, move to front
             self.nodes[index].value = value;
             self.unlink(index);
             self.push_front(index);
         } else {
             // Key is new: evict if at capacity
-            if self.map.len() >= self.capacity {
-                if let Some(evicted_key) = self.evict_tail() {
-                    self.map.remove(&evicted_key);
-                }
+            if self.map.len() >= self.capacity
+                && let Some(evicted_key) = self.evict_tail()
+            {
+                self.map.remove(&evicted_key);
             }
 
             // Allocate and insert new node at head
@@ -182,19 +176,18 @@ pub fn put(&mut self, key: K, value: V) {
             self.push_front(index);
             self.map.insert(key, index);
         }
-}
-pub fn len(&self) -> usize{
-    self.map.len()
-}
-pub fn is_empty(&self)->bool {
-    self.map.is_empty()
-}
+    }
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
-
 
 #[cfg(test)]
 mod tests {
