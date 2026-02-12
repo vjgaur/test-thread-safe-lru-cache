@@ -9,35 +9,34 @@ eviction behavior under contention.
 
 ## 2. Architecture Overview
 
-The implementation is split into two layers with clear separation of concerns:
+The implementation is split into layers with clear separation of concerns.
+Two thread-safe wrappers are provided: a simple Mutex-based cache and a
+sharded cache for higher concurrency throughput.
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                  Public API Layer                     │
-│            ThreadSafeLruCache<K, V>                  │
-│         (Arc<Mutex<LruCache<K, V>>>)                 │
-│                                                      │
-│   get(&self, key) -> Option<V>    (returns clone)    │
-│   put(&self, key, value)                             │
-│   len(&self) -> usize                                │
-│   is_empty(&self) -> bool                            │
-├─────────────────────────────────────────────────────┤
-│                Synchronization Layer                  │
-│              std::sync::Mutex                        │
-│                                                      │
-│   • Single lock per cache instance                   │
-│   • Acquired and released within each method call    │
-│   • O(1) critical sections — no extended blocking    │
-├─────────────────────────────────────────────────────┤
-│                  Core Logic Layer                     │
-│              LruCache<K, V>                          │
-│                                                      │
-│   HashMap<K, usize>   +   Vec<Node<K,V>> Arena      │
-│   (key → arena index)     (doubly-linked list)       │
-│                                                      │
-│   head ←→ ... ←→ tail                                │
-│   (MRU)          (LRU)                               │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Public API Layer                              │
+│                                                                     │
+│  ThreadSafeLruCache<K, V>          ShardedLruCache<K, V>            │
+│  (Arc<Mutex<LruCache>>)           (N × Mutex<LruCache>)            │
+│  Simple, single lock               Hash-routed, N independent locks │
+│                                                                     │
+│  get / put / len / is_empty        get / put / len / is_empty       │
+├──────────────────────────┬──────────────────────────────────────────┤
+│   Synchronization        │         Synchronization                  │
+│   Single Mutex           │     hash(key) % N → shard Mutex          │
+│                          │     Threads on different shards don't     │
+│                          │     block each other                      │
+├──────────────────────────┴──────────────────────────────────────────┤
+│                        Core Logic Layer                              │
+│                        LruCache<K, V>                               │
+│                                                                     │
+│   HashMap<K, usize>   +   Vec<Node<K,V>> Arena                     │
+│   (key → arena index)     (doubly-linked list)                      │
+│                                                                     │
+│   head ←→ ... ←→ tail                                               │
+│   (MRU)          (LRU)                                              │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Module Structure
@@ -46,23 +45,30 @@ The implementation is split into two layers with clear separation of concerns:
 src/
 ├── lib.rs          Public API re-exports
 ├── lru.rs          Core single-threaded LRU logic + unit tests
-└── cache.rs        Thread-safe Mutex wrapper
+├── cache.rs        Thread-safe Mutex wrapper
+└── sharded.rs      Sharded cache (N independent Mutex<LruCache> shards)
 
 tests/
 ├── lru_tests.rs              Integration tests (public API)
-└── concurrency_tests.rs      Multi-threaded correctness tests
+├── concurrency_tests.rs      Multi-threaded correctness tests
+└── sharded_tests.rs          Sharded cache concurrency tests
+
+benches/
+└── benchmark.rs              Criterion benchmarks (Mutex vs RwLock vs Sharded)
 ```
 
 **Why this separation?**
 
 The core LRU logic in `lru.rs` is completely unaware of threading. It is a
 plain `&mut self` API — simple to reason about, test, and debug. The thread-safe
-wrapper in `cache.rs` is a thin layer that adds `Mutex` synchronization. This
-means:
+wrappers (`cache.rs` and `sharded.rs`) are thin layers that add synchronization.
+This means:
 
 - The eviction algorithm can be tested independently without thread complexity.
-- The synchronization layer can be swapped (e.g., to `tokio::sync::Mutex` for
-  async) without touching the core logic.
+- The synchronization layer can be swapped (e.g., single Mutex, sharded, or
+  `tokio::sync::Mutex` for async) without touching the core logic.
+- Both `ThreadSafeLruCache` and `ShardedLruCache` reuse the same `LruCache`
+  implementation — no code duplication.
 - Each layer has a single, clear responsibility.
 
 ## 3. Data Structures
@@ -203,15 +209,33 @@ internal state.
 
 With `RwLock`, we would face two bad options:
 
-1. **Acquire write lock for every `get`** — negates all benefits of RwLock,
-   adds overhead from RwLock's more complex implementation.
+1. **Acquire write lock for every `get`** — negates RwLock's read-concurrency
+   advantage, since no operation can use a read lock.
 2. **Acquire read lock, then upgrade to write lock** — Rust's `std::sync::RwLock`
    does not support lock upgrading. Attempting to acquire a write lock while
    holding a read lock causes deadlock.
 
-A `Mutex` is the honest choice: every operation mutates, so every operation
-takes an exclusive lock. It is simpler, has lower overhead than RwLock, and
-has zero risk of deadlock with a single lock.
+We chose `Mutex` for three reasons:
+
+**Simplicity and correctness.** Every operation mutates, so every operation
+takes an exclusive lock. Single-owner semantics are easier to reason about,
+with zero risk of accidentally using `read()` for a `get` variant.
+
+**Predictable scaling under high contention.** Benchmarks revealed that RwLock
+can outperform Mutex at low thread counts (1-4 threads) due to platform-specific
+lock implementation differences — not because of read/write splitting (since all
+operations take write locks). However, at 8 threads under write-heavy workloads,
+RwLock degrades significantly worse than Mutex (494K vs 742K ops/s). Mutex's
+simpler implementation scales more predictably under real contention.
+
+**Portability.** RwLock's low-contention advantage is platform-specific
+(`pthread_rwlock` fast-path behavior on Linux). It is not guaranteed across
+operating systems or kernel versions. Mutex behavior is more consistent
+cross-platform.
+
+**For actual throughput scaling, the answer is sharding, not RwLock** — see
+Section 5.6 and [BENCHMARKS.md](BENCHMARKS.md) for measured results showing
+3-4x improvement over both Mutex and RwLock at high thread counts.
 
 ### 5.2 Lock Scope and Critical Section Duration
 
@@ -274,6 +298,60 @@ data structure may be in an inconsistent state (e.g., a node was unlinked but
 not yet pushed to front). Operating on corrupt state would be worse than
 panicking.
 
+### 5.6 Sharded Strategy (Bonus Implementation)
+
+To address the single-lock bottleneck under high contention, we also
+implemented `ShardedLruCache` which partitions the keyspace across N
+independent `Mutex<LruCache>` shards:
+
+```
+┌──────────────────────────────────────────────────────┐
+│                 ShardedLruCache                        │
+│                                                       │
+│   key → hash(key) % N → shard index                  │
+│                                                       │
+│   ┌─────────┐  ┌─────────┐       ┌─────────┐        │
+│   │ Shard 0 │  │ Shard 1 │  ...  │ Shard N │        │
+│   │ Mutex<  │  │ Mutex<  │       │ Mutex<  │        │
+│   │ LruCache│  │ LruCache│       │ LruCache│        │
+│   └─────────┘  └─────────┘       └─────────┘        │
+│                                                       │
+│   Threads on different shards never block each other  │
+└──────────────────────────────────────────────────────┘
+```
+
+**Key design decisions:**
+
+- **Shard count:** Defaults to `min(16, capacity)`. Each shard needs at
+  least 1 slot, so shard count cannot exceed capacity.
+
+- **Capacity distribution:** `capacity / num_shards` per shard, with the
+  remainder distributed to the first shards (no wasted slots).
+
+- **Per-shard LRU:** Each shard maintains its own independent LRU ordering.
+  This means eviction is approximate — a globally "least recent" key might
+  survive if its shard has room, while a more recent key in a full shard
+  gets evicted. This is an accepted trade-off for significantly better
+  concurrent throughput.
+
+- **No `Clone` on the struct:** Unlike `ThreadSafeLruCache` which derives
+  `Clone` via `Arc`, `ShardedLruCache` is shared via `Arc<ShardedLruCache>`
+  directly. The struct itself holds the `Vec<Mutex<LruCache>>`.
+
+- **Deadlock freedom:** Each operation touches exactly one shard lock. No
+  operation ever acquires two shard locks simultaneously, making deadlock
+  impossible.
+
+**Benchmark-validated performance** (see [BENCHMARKS.md](BENCHMARKS.md)):
+
+| Scenario | Mutex | Sharded | Speedup |
+|----------|-------|---------|---------|
+| 1 thread (mixed) | 10.6M ops/s | 7.8M ops/s | 0.73x (hash overhead) |
+| 4 threads (writes) | 1.0M ops/s | 3.1M ops/s | **3.1x faster** |
+| 8 threads (writes) | 742K ops/s | 2.9M ops/s | **3.9x faster** |
+| 8 threads (reads) | 1.5M ops/s | 4.0M ops/s | **2.6x faster** |
+| 8 threads (mixed) | 1.3M ops/s | 4.2M ops/s | **3.3x faster** |
+
 ## 6. Concurrency Correctness
 
 ### 6.1 Why Single Mutex is Sufficient
@@ -298,6 +376,8 @@ cache instance, cycles are impossible. Our implementation:
 
 ### 6.3 What We Tested
 
+**ThreadSafeLruCache (Mutex) tests:**
+
 | Test | Threads | Ops | What It Validates |
 |------|---------|-----|-------------------|
 | `concurrent_writes_respect_capacity` | 8 | 8,000 | Capacity bound holds under concurrent inserts |
@@ -308,6 +388,19 @@ cache instance, cycles are impossible. Our implementation:
 | `concurrent_capacity_one` | 8 | 8,000 | Edge case: capacity-1 under contention |
 | `cloned_handles_share_state` | 2 | 1 | Arc clone semantics work correctly |
 | `stress_test_high_volume` | 16 | 80,000 | Mixed read/write patterns under heavy load |
+
+**ShardedLruCache tests:**
+
+| Test | Threads | What It Validates |
+|------|---------|-------------------|
+| `sharded_concurrent_writes_respect_capacity` | 8 | Total entries ≤ capacity across all shards |
+| `sharded_concurrent_reads_and_writes` | 8 | Interleaved operations across shards |
+| `sharded_concurrent_updates_same_keys` | 8 | Value consistency under per-shard eviction |
+| `sharded_no_deadlock_under_contention` | 8 | No deadlock with cross-shard access patterns |
+| `sharded_get_returns_consistent_values` | 8 | No torn reads across shards |
+| `sharded_stress_test_high_volume` | 16 | Heavy load across 16 shards |
+| `sharded_different_shard_counts` | 4 | Correctness with 1, 2, 4, 8, 16 shards |
+| `sharded_single_shard_behaves_like_mutex` | 1 | 1-shard == single Mutex behavior |
 
 All concurrency tests use `Barrier` to force threads to start simultaneously,
 maximizing lock contention and the chance of exposing race conditions.
@@ -336,19 +429,21 @@ Memory is bounded because:
 
 | Decision | What We Gain | What We Give Up |
 |---|---|---|
-| Single Mutex | Simplicity, correctness, deadlock-free | Operations serialize under contention |
+| Single Mutex (ThreadSafeLruCache) | Simplicity, correctness, deadlock-free | Operations serialize under contention |
+| Sharded Mutex (ShardedLruCache) | 2-5x throughput at 2+ threads | ~20% single-thread overhead, per-shard LRU |
 | Arena-based list | Safe Rust, cache-friendly, O(1) | Evicted slots aren't freed (recycled instead) |
 | Clone on `get` | Short critical sections, no lock leakage | Clone overhead; requires `V: Clone` |
-| No sharding | Simple implementation, easy to reason about | Single contention point under high load |
 | `K: Clone` bound | Needed for eviction (clone key for HashMap removal) | Excludes non-Clone key types |
 | `expect()` on poison | Fail-fast on corrupted state | Panic instead of graceful degradation |
+| 16 default shards | Good scaling up to 16 threads | Slightly more memory than single Mutex |
 
 ## 9. Known Limitations
 
-1. **Single lock bottleneck**: Under extremely high contention from many
-   threads, all operations serialize through one Mutex. A sharded approach
-   (partitioning the keyspace across N independent `Mutex<LruCache>` instances)
-   would improve throughput linearly with shard count.
+1. **Per-shard LRU approximation**: The sharded cache evicts per-shard, not
+   globally. A key that is "least recently used" globally might survive in a
+   shard with room, while a more recent key in a full shard gets evicted.
+   For most caching workloads this is acceptable, but applications requiring
+   strict global LRU ordering should use `ThreadSafeLruCache`.
 
 2. **Clone requirement**: Both `K` and `V` must implement `Clone`. For large
    values, this can be mitigated by storing `Arc<V>` (clone is just a refcount
@@ -371,11 +466,18 @@ Memory is bounded because:
    capacity, but the index-to-physical-position mapping becomes non-sequential
    over time.
 
-## 10. Potential Improvements
+## 10. Implemented Bonus Features
 
-- **Sharded cache**: Partition keyspace across N `Mutex<LruCache>` instances
-  using `hash(key) % N`. Reduces contention linearly with shard count.
-  Trade-off: LRU ordering becomes approximate (per-shard rather than global).
+- **Sharded cache** (`ShardedLruCache`): Partitions keyspace across N
+  `Mutex<LruCache>` instances using `hash(key) % N`. Achieves 2-5x throughput
+  improvement over single Mutex at 2+ threads. See `src/sharded.rs`.
+
+- **Performance comparison** (Criterion benchmarks): Empirical comparison of
+  Mutex vs RwLock vs Sharded across workloads and thread counts. Validates
+  design decisions with measured data. See [BENCHMARKS.md](BENCHMARKS.md)
+  and `benches/benchmark.rs`.
+
+## 11. Potential Further Improvements
 
 - **Async support**: Replace `std::sync::Mutex` with `tokio::sync::Mutex` and
   add `.await` to lock acquisition. The core `LruCache` logic remains unchanged.

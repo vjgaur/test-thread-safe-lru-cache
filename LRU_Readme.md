@@ -1,7 +1,8 @@
 # LRU Cache — Implementation Guide
 
 A thread-safe Least Recently Used (LRU) cache implementation in Rust, built
-with safe Rust only and zero external dependencies.
+with safe Rust only and zero runtime dependencies. Includes a sharded variant
+for high-concurrency throughput.
 
 ## Quick Start
 
@@ -28,11 +29,17 @@ cargo test --lib
 # Run only integration tests
 cargo test --test lru_tests
 
-# Run only concurrency tests
+# Run only concurrency tests (Mutex-based)
 cargo test --test concurrency_tests
+
+# Run only sharded cache tests
+cargo test --test sharded_tests
 
 # Run a specific test by name
 cargo test test_eviction_removes_lru
+
+# Run benchmarks (Mutex vs RwLock vs Sharded)
+cargo bench
 ```
 
 ### Lint and Format
@@ -49,14 +56,19 @@ cargo clippy --tests -- -D warnings
 ├── Cargo.toml
 ├── README.md                  Assignment specification
 ├── DESIGN.md                  Architecture and design decisions
+├── BENCHMARKS.md              Performance comparison with analysis
 ├── LRUReadme.md               This file
 ├── src/
 │   ├── lib.rs                 Public API re-exports
 │   ├── lru.rs                 Core LRU logic (single-threaded)
-│   └── cache.rs               Thread-safe wrapper (Arc<Mutex>)
-└── tests/
-    ├── lru_tests.rs           Integration tests for public API
-    └── concurrency_tests.rs   Multi-threaded correctness tests
+│   ├── cache.rs               Thread-safe wrapper (Arc<Mutex>)
+│   └── sharded.rs             Sharded cache (N independent Mutex<LruCache>)
+├── tests/
+│   ├── lru_tests.rs           Integration tests for public API
+│   ├── concurrency_tests.rs   Multi-threaded correctness tests
+│   └── sharded_tests.rs       Sharded cache concurrency tests
+└── benches/
+    └── locking_strategies.rs  Criterion benchmarks (Mutex vs RwLock vs Sharded)
 ```
 
 ## API Reference
@@ -142,14 +154,75 @@ caller's use of that reference, which would block all other threads.
 **Tip:** For large values, use `ThreadSafeLruCache<K, Arc<V>>` to make
 cloning cheap (reference count increment instead of deep copy).
 
+### `ShardedLruCache<K, V>` — High-Concurrency
+
+Distributes keys across N independent `Mutex<LruCache>` shards for reduced
+lock contention. Threads operating on keys in different shards never block
+each other.
+
+```rust
+use lru_cache::ShardedLruCache;
+use std::sync::Arc;
+use std::thread;
+
+let cache = Arc::new(ShardedLruCache::new(1000)); // 16 shards by default
+
+let handles: Vec<_> = (0..8)
+    .map(|t| {
+        let cache = Arc::clone(&cache);
+        thread::spawn(move || {
+            for i in 0..5000 {
+                cache.put(t * 5000 + i, i);
+            }
+        })
+    })
+    .collect();
+
+for h in handles {
+    h.join().unwrap();
+}
+
+assert!(cache.len() <= 1000);
+```
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `new` | `fn new(capacity: usize) -> Self` | Creates a sharded cache with up to 16 shards. Panics if capacity is 0. |
+| `with_shards` | `fn with_shards(capacity: usize, num_shards: usize) -> Self` | Creates a cache with a custom shard count. Panics if shards > capacity. |
+| `get` | `fn get(&self, key: &K) -> Option<V>` | Returns a cloned value. Only locks the owning shard. |
+| `put` | `fn put(&self, key: K, value: V)` | Inserts or updates. Only locks the owning shard. |
+| `len` | `fn len(&self) -> usize` | Total entries across all shards (acquires each shard lock sequentially). |
+| `is_empty` | `fn is_empty(&self) -> bool` | True if all shards are empty. |
+| `num_shards` | `fn num_shards(&self) -> usize` | Returns the number of shards. |
+
+**Type constraints:** Same as `ThreadSafeLruCache` — `K: Hash + Eq + Clone + Send + 'static`,
+`V: Clone + Send + 'static`
+
+**Sharing:** Use `Arc<ShardedLruCache>` for cross-thread sharing (the struct
+itself is not `Clone` — wrap in `Arc` explicitly).
+
+**Trade-off:** Eviction is per-shard, not global. A key that is globally
+"least recently used" might survive if its shard has room, while a more
+recent key in a full shard gets evicted. This is accepted for the 3-4x
+throughput improvement at high concurrency.
+
+**When to use which:**
+
+| Scenario | Use |
+|----------|-----|
+| Single-threaded | `LruCache` |
+| Low concurrency (1-2 threads) | `ThreadSafeLruCache` |
+| High concurrency (4+ threads) | `ShardedLruCache` |
+
 ## Test Summary
 
-The project contains 31 tests across three test suites:
+The project contains 48 tests across four test suites:
 
-### Unit Tests (10 tests in `src/lru.rs`)
+### Unit Tests (19 tests in `src/lru.rs` and `src/sharded.rs`)
 
-Test the core LRU logic directly, including private internals.
+Test the core LRU logic and sharded cache directly.
 
+**LruCache (10 tests):**
 - Basic put and get
 - Get nonexistent key
 - Eviction removes LRU item
@@ -160,6 +233,17 @@ Test the core LRU logic directly, including private internals.
 - Sequential eviction order
 - Repeated updates preserve capacity
 - Zero capacity panics
+
+**ShardedLruCache (9 tests):**
+- Basic put and get
+- Capacity distribution across shards
+- Eviction within shard
+- Len and is_empty
+- Update existing key
+- Total capacity bounded
+- Zero capacity panics
+- Zero shards panics
+- Shards exceed capacity panics
 
 ### Integration Tests (13 tests in `tests/lru_tests.rs`)
 
@@ -176,7 +260,7 @@ Test both `LruCache` and `ThreadSafeLruCache` through the public API.
 
 ### Concurrency Tests (8 tests in `tests/concurrency_tests.rs`)
 
-Validate thread safety under contention using barriers for synchronized starts.
+Validate `ThreadSafeLruCache` thread safety under contention using barriers.
 
 - Concurrent writes respect capacity (8 threads × 1,000 ops)
 - Concurrent reads and writes
@@ -187,18 +271,33 @@ Validate thread safety under contention using barriers for synchronized starts.
 - Cloned handles share state across threads
 - High-volume stress test (16 threads × 5,000 ops)
 
+### Sharded Concurrency Tests (8 tests in `tests/sharded_tests.rs`)
+
+Validate `ShardedLruCache` under concurrent access.
+
+- Concurrent writes respect total capacity across shards
+- Concurrent reads and writes across shards
+- Concurrent updates with per-shard eviction consistency
+- Deadlock detection with cross-shard access patterns
+- Get returns consistent values across shards
+- High-volume stress test (16 threads × 5,000 ops)
+- Correctness with different shard counts (1, 2, 4, 8, 16)
+- Single shard behaves identically to Mutex-based cache
+
 ## Design Decisions
 
 For the full design rationale, architecture diagrams, and trade-off analysis,
-see [Design.md](Design.md).
+see [DESIGN.md](DESIGN.md).
 
 Key decisions summarized:
 
 - **HashMap + arena-based doubly-linked list** for O(1) operations in safe Rust
-- **Mutex over RwLock** because `get` mutates internal state (move-to-front)
+- **Mutex over RwLock** because `get` mutates internal state; Mutex is simpler,
+  more predictable under high contention, and portable across platforms
+- **Sharded variant** for 3-4x throughput at 4+ threads, with per-shard LRU trade-off
 - **Clone on get** to avoid leaking lock scope to callers
 - **Free list slot recycling** for bounded, predictable memory usage
-- **No external dependencies** — built entirely on `std`
+- **Criterion benchmarks** validating all design decisions with measured data
 
 ## Assumptions
 
@@ -210,4 +309,7 @@ Key decisions summarized:
 
 ## Dependencies
 
-None. This project uses only the Rust standard library.
+**Runtime:** None. The library uses only the Rust standard library.
+
+**Dev only:** [Criterion](https://crates.io/crates/criterion) v0.5 for benchmarks
+(`cargo bench`). Not required for building or using the library.

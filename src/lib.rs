@@ -6,6 +6,8 @@
 
 pub mod cache;
 pub mod lru;
+mod sharded;
 
 pub use cache::ThreadSafeLruCache;
 pub use lru::LruCache;
+pub use sharded::ShardedLruCache;
